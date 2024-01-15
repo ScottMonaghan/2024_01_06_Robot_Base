@@ -7,6 +7,12 @@ from time import (
     )
 import countio
 import asyncio
+import wifi
+import socketpool
+import ipaddress
+import os
+import ssl
+import json
 
 #modified from https://www.kevsrobots.com/resources/how_it_works/pid-controllers.html
 class PID:
@@ -74,6 +80,10 @@ class ZS_X11H_BLDCWheel:
                 self.current_rpm = pulses_per_second / PULSES_PER_ROTATION * 60
             await asyncio.sleep(0)
 
+async def udp_monitor():
+    while True:
+        await asyncio.sleep(0)
+
 async def main():  
     right_wheel_pwm = pwmio.PWMOut(board.GP1, frequency=20000)
     right_wheel_pulse_counter = countio.Counter(board.GP3, edge=countio.Edge.RISE)
@@ -86,8 +96,18 @@ async def main():
     right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid)
     left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid)
 
+    #set up udp
+    client_ipv4 =  ipaddress.IPv4Address(os.getenv('ROBOT_BASE_IPV4'))
+    netmask =  ipaddress.IPv4Address(os.getenv('CIRCUITPY_NETMASK'))
+    gateway =  ipaddress.IPv4Address(os.getenv('CIRCUITPY_GATEWAY'))
+    wifi.radio.set_ipv4_address(ipv4=client_ipv4,netmask=netmask,gateway=gateway)
+    #  connect to your SSID
+    wifi.radio.connect(os.getenv('CIRCUITPY_WIFI_SSID'), os.getenv('CIRCUITPY_WIFI_PASSWORD'))
+    ssl_context = ssl.create_default_context()
+
     right_wheel_rpm_monitor_task = asyncio.create_task(right_wheel.rpm_monitor(2,0.5))
     left_wheel_rpm_monitor_task = asyncio.create_task(left_wheel.rpm_monitor(2,0.5))
+    udp_input_monitor_task = asyncio.create_task(udp_monitor())
 
     right_wheel.pwm_out.duty_cycle = 0
     left_wheel.pwm_out.duty_cycle = 0
