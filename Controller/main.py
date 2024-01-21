@@ -21,7 +21,7 @@ import json
 throttle_pot = AnalogIn(board.A0)
 MAX_RAW_THROTTLE = 64000
 MIN_RAW_THROTTLE = 500
-RATE_IN_HERTZ = 60
+RATE_IN_HERTZ = 20
 MAX_RPM = 100
 MIN_RPM = 20
 
