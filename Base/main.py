@@ -99,7 +99,7 @@ class ZS_X11H_BLDCWheel:
             # set pwm to zero 
             self.pwm_out.duty_cycle = 0
             self.current_rpm = 0
-            sleep(0.1)
+            sleep(0.05)
             self._reverse_is_disabled.value = not self._reverse_is_disabled.value
         self._target_rpm = value
 
