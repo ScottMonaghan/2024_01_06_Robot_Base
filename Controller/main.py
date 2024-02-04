@@ -22,17 +22,24 @@ throttle_pot = AnalogIn(board.A0)
 MAX_RAW_THROTTLE = 64000
 MIN_RAW_THROTTLE = 500
 RATE_IN_HERTZ = 20
-MAX_RPM = 100
-MIN_RPM = 20
+MAX_RPM = 50
+MIN_RPM = 15
 
 btn_up= DigitalInOut(board.GP3)
 btn_down = DigitalInOut(board.GP2)
+btn_left = DigitalInOut(board.GP1)
+btn_right = DigitalInOut(board.GP4)
 
 btn_up.direction = Direction.INPUT
 btn_down.direction = Direction.INPUT
+btn_left.direction = Direction.INPUT
+btn_right.direction = Direction.INPUT
+
 
 btn_up.pull = Pull.DOWN
 btn_down.pull = Pull.DOWN
+btn_left.pull = Pull.DOWN
+btn_right.pull = Pull.DOWN
 
 # #  set static IP address
 client_ipv4 =  ipaddress.IPv4Address(os.getenv('ROBOT_BASE_CONTROLLER_IPV4'))
@@ -81,6 +88,8 @@ while True:
     command = "STOP"
     if btn_up.value: command = "FORWARD"
     elif btn_down.value: command = "BACK"
+    elif btn_left.value: command = "LEFT"
+    elif btn_right.value: command = "RIGHT"
 
     
     publish_args = {
@@ -91,7 +100,7 @@ while True:
 
     payload = json.dumps(publish_args)
     size = s.sendto(payload, (HOST, PORT))
-    #print(payload)
+    print(payload)
 
     loop_duration = monotonic() - loop_start
     if loop_duration < target_loop_duration:
