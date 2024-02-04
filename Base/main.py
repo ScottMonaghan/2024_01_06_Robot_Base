@@ -24,7 +24,7 @@ import busio
 from errno import ETIMEDOUT
 from random import (randrange, random)
 
-DEMO = True
+DEMO = False
 
 RATE = 10 #target rate in hz
 SCALE_TIME_NS = 1e-9
@@ -32,9 +32,14 @@ SCALE_TIME_MS = 1e-3
 SCALE_PWM = 1e-1
 SCALE_ERROR = 10
 SCALE_HEADING_CORRECTION = 0.5
-RPM_TIMEOUT = 0.5
 PULSES_PER_ROTATION = 45
 MIN_PULSES_FOR_CALCULATION = 3
+RPM_MONITOR_ZERO_TIMEOUT = 0.5
+MIN_NONZERO_THROTTLE = 50
+DIFFERENTIAL_MIN_TICKS = 2
+PID_KP = 1.0
+PID_KI = 2e-5
+PID_KD = 0 
 
 #modified from https://www.kevsrobots.com/resources/how_it_works/pid-controllers.html
 class PID:
@@ -44,6 +49,7 @@ class PID:
         self.Kd = Kd
         self.last_error = 0
         self.integral = 0
+        self.last_time = 0
 
     def update(self, error, dt):
         if dt > 0:
@@ -67,15 +73,20 @@ class ZS_X11H_BLDCWheel:
             pulse_counter:countio.Counter,
             pulses_per_rotation:int,
             pid:PID,
-            reverse_is_disabled:DigitalInOut,
+            reverse_switch:DigitalInOut,
+            reverse_value: bool
             ):
         self.pwm_out = pwm_out
         self.pulse_counter = pulse_counter
         self.pid = pid
+        self.rmp_monitor_enabled = True
         self._current_rpm = 0.0
         self._target_rpm = 0
         self._last_pulse_record = PulseRecord(self.pulse_counter.count,monotonic_ns() * SCALE_TIME_NS)
-        self._reverse_is_disabled = reverse_is_disabled
+        self._reverse_value = reverse_value
+        self._reverse_switch = reverse_switch
+        self._reverse_switch.value = not self._reverse_value
+        self._lock_target_rpm = False
 
     @property
     def current_rpm(self):
@@ -89,18 +100,18 @@ class ZS_X11H_BLDCWheel:
     def target_rpm(self):
         return self._target_rpm
     
-    @target_rpm.setter
-    def target_rpm(self, value):
+    async def set_target_rpm(self, value):
         if (
-            (value < 0 and self._reverse_is_disabled.value == True)
-            or (value > 0 and self._reverse_is_disabled.value == False)
+            (value < 0 and self._reverse_switch.value != self._reverse_value)
+            or (value > 0 and self._reverse_switch.value == self._reverse_value)
             ):
-            # we need to change direction
-            # set pwm to zero 
-            self.pwm_out.duty_cycle = 0
-            self.current_rpm = 0
-            sleep(0.05)
-            self._reverse_is_disabled.value = not self._reverse_is_disabled.value
+            # # we need to change direction
+            self._target_rpm = 0
+            self.throttle = 0
+            await asyncio.sleep(0.05)
+            self._reverse_switch.value = not self._reverse_switch.value
+            #now reset target value
+            self._target_rpm = value
         self._target_rpm = value
 
     @property
@@ -109,24 +120,75 @@ class ZS_X11H_BLDCWheel:
     
     @throttle.setter
     def throttle(self, value):
-        if value < 200: 
+        if value < MIN_NONZERO_THROTTLE: 
             value = 0
         self.pwm_out.duty_cycle = clamp(abs(value),0,65535)
     
     async def rpm_monitor(self, min_ticks, timeout):
         while True:
-            # if self._reverse_is_disabled.value else -1 
             self.pulse_counter.reset()
             start_time = monotonic()
-            while self.pulse_counter.count < min_ticks and monotonic()-start_time < timeout:
+            while self.pulse_counter.count < min_ticks and monotonic()-start_time < timeout and self.rmp_monitor_enabled:
                 await asyncio.sleep(0)
-            if monotonic()-start_time > timeout:
-                 #print(monotonic()-start_time)
-                 self.current_rpm = 0
-            else:
-                pulses_per_second = self.pulse_counter.count / (monotonic() - start_time)
-                self.current_rpm = pulses_per_second / PULSES_PER_ROTATION * 60
+            if self.rmp_monitor_enabled:
+                if monotonic()-start_time > timeout:
+                    #print(monotonic()-start_time)
+                    self.current_rpm = 0
+                else:
+                    pulses_per_second = self.pulse_counter.count / (monotonic() - start_time)
+                    self.current_rpm = pulses_per_second / PULSES_PER_ROTATION * 60
             await asyncio.sleep(0)
+ 
+async def differential_synced_rpm_monitor(left_wheel:ZS_X11H_BLDCWheel, right_wheel:ZS_X11H_BLDCWheel, min_ticks:int, timeout:float):
+    while True:
+        left_wheel.pulse_counter.reset()
+        right_wheel.pulse_counter.reset()
+        start_time = monotonic()
+        while (
+            (left_wheel.pulse_counter.count < min_ticks
+            or right_wheel.pulse_counter.count < min_ticks)
+            and monotonic()-start_time < timeout
+            ):
+            await asyncio.sleep(0)
+
+        left_wheel.current_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else calc_rpm(left_wheel,start_time)
+        right_wheel.current_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else calc_rpm(right_wheel,start_time)
+
+        ##lets see what happens if we do pid here
+        current_time = monotonic_ns() * SCALE_TIME_NS
+        dt = current_time - left_wheel.pid.last_time
+        left_wheel.pid.last_time = current_time
+        right_wheel.pid.last_time = current_time
+
+        # calculate error for PID
+        left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
+        right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
+ 
+        # #calc PID adjustent
+        left_adjustment = left_wheel.pid.update(left_error, dt)
+        right_adjustment = right_wheel.pid.update(right_error,dt)
+
+        left_wheel.throttle = 0 if left_wheel.target_rpm == 0 else left_wheel.throttle + int(left_adjustment / SCALE_PWM)
+        right_wheel.throttle = 0 if right_wheel.target_rpm == 0 else right_wheel.throttle + int(right_adjustment / SCALE_PWM)
+
+        # print(
+        #     left_wheel.target_rpm,
+        #     left_wheel.current_rpm,
+        #     left_error,
+        #     left_adjustment,
+        #     left_wheel.throttle
+
+        # )
+        await asyncio.sleep(0)
+
+
+def calc_rpm(wheel:ZS_X11H_BLDCWheel, start_time:float)->float:
+    duration = monotonic() - start_time
+    if duration > 0:
+        pulses_per_second = wheel.pulse_counter.count / duration
+        return pulses_per_second / PULSES_PER_ROTATION * 60
+    else:
+        return wheel.current_rpm 
 
 class Robot:
     def __init__(self):
@@ -175,26 +237,45 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
                 command = buf[:size].decode()
                 #print('Command: ' + command)
                 received_args = json.loads(command)
+                correct_heading = False
                 if received_args['command'] == 'STOP':
-                    right_wheel.target_rpm = 0
-                    left_wheel.target_rpm = 0
+                    await right_wheel.set_target_rpm(0)
+                    await left_wheel.set_target_rpm(0)
                     target_heading = bno055.euler[0]
-                    print(f'target heading:{target_heading}')
-                elif received_args['command'] == 'FORWARD':
-                    rw_target_rpm = received_args['target_rpm']
-                    lw_target_rpm = received_args['target_rpm']
+                    #print(f'target heading:{target_heading}')
+                else:
+                    if received_args['command'] == 'FORWARD':
+                        rw_target_rpm = received_args['target_rpm']
+                        lw_target_rpm = received_args['target_rpm']
+                        left_heading_multiplier = -1
+                        right_heading_multiplier = 1
+                        correct_heading = True
+                    #     print('FORWARD')
+                    elif received_args['command'] == 'BACK':
+                        rw_target_rpm = -1 * received_args['target_rpm']
+                        lw_target_rpm = -1 * received_args['target_rpm']
+                        left_heading_multiplier = 1
+                        right_heading_multiplier = -1
+                        correct_heading = True
+                    elif received_args['command'] == 'RIGHT':
+                        lw_target_rpm = 1 * received_args['target_rpm']
+                        rw_target_rpm = -1 * received_args['target_rpm']
+                    elif received_args['command'] == 'LEFT':
+                        lw_target_rpm = -1 * received_args['target_rpm']
+                        rw_target_rpm = 1 * received_args['target_rpm']
 
-                    heading_correction = (bno055.euler[0] - target_heading) * SCALE_HEADING_CORRECTION
-                    if abs(heading_correction) > 180:
-                        heading_correction = heading_correction - 180
-                    print(heading_correction)
+                    if correct_heading:
+                        heading_correction = ((bno055.euler[0] - target_heading)/180)
+                        if abs(heading_correction) > 180:
+                            heading_correction = 180 - heading_correction
+                    else: heading_correction = 0
 
-                    left_wheel.target_rpm = lw_target_rpm - heading_correction
-                    right_wheel.target_rpm = rw_target_rpm + heading_correction
+                    await left_wheel.set_target_rpm(int(lw_target_rpm + left_heading_multiplier * lw_target_rpm * heading_correction)) 
+                    await right_wheel.set_target_rpm(int(rw_target_rpm + right_heading_multiplier * rw_target_rpm * heading_correction))
                 last_command_received = monotonic()
             if monotonic() - last_command_received > SAFETY_TIMEOUT:
-                right_wheel.target_rpm = 0
-                left_wheel.target_rpm = 0
+                await right_wheel.set_target_rpm(0)
+                await left_wheel.set_target_rpm(0)
                 print("SAFETY TIMEOUT")
         except OSError as e:
             if e.errno == ETIMEDOUT:
@@ -207,88 +288,98 @@ async def demo_mode(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWheel,
     min_rpm = -100
     max_rpm = 100
     rpm_step = 20
-    step_delay = 1
+    step_delay = 5
     target_rpm = 0
-    left_wheel.target_rpm = target_rpm
+    await left_wheel.set_target_rpm(target_rpm)
+    await right_wheel.set_target_rpm(target_rpm)
     step_multiplier = 1
     while True:
-
-        new_abs_target_rpm = randrange(20,100)
+        new_abs_target_rpm = randrange(15,40)
         multiplier = 1 if random() * 2 -1 > 0 else -1
-        left_wheel.target_rpm = new_abs_target_rpm * multiplier
+        await left_wheel.set_target_rpm(new_abs_target_rpm * multiplier)
+        await right_wheel.set_target_rpm(new_abs_target_rpm * multiplier)
         await asyncio.sleep(step_delay)
-        
-        # if target_rpm >= max_rpm:
-        #     target_rpm = max_rpm
-        #     step_multiplier = -1
-        # elif target_rpm <= min_rpm:
-        #     target_rpm = min_rpm
-        #     step_multiplier = 1
-        # target_rpm += rpm_step * step_multiplier
-        # left_wheel.target_rpm=target_rpm
 
 async def main():
     i2c = busio.I2C(board.GP13,board.GP12)
     bno055 = adafruit_bno055.BNO055_I2C(i2c)
     right_wheel_pwm = pwmio.PWMOut(board.GP1, frequency=20000)
     right_wheel_pulse_counter = countio.Counter(board.GP3, edge=countio.Edge.RISE)
-    right_wheel_pid = PID(Kp=1.0, Ki=0.04, Kd=0)
-    right_wheel_reverse_disabled = DigitalInOut(board.GP17)
-    right_wheel_reverse_disabled.direction = Direction.OUTPUT
-    right_wheel_reverse_disabled.value = True 
+    right_wheel_pid = PID(Kp=PID_KP, Ki=PID_KI, Kd=PID_KD)
+    right_wheel_reverse_switch = DigitalInOut(board.GP0)
+    right_wheel_reverse_switch.direction = Direction.OUTPUT
+    right_wheel_reverse_switch.value = False 
 
     left_wheel_pwm = pwmio.PWMOut(board.GP4, frequency=20000)
     left_wheel_pulse_counter = countio.Counter(board.GP7, edge=countio.Edge.RISE)
-    left_wheel_pid = PID(Kp=1.0, Ki=0.04, Kd=0)
-    left_wheel_reverse_disabled = DigitalInOut(board.GP16)
-    left_wheel_reverse_disabled.direction = Direction.OUTPUT
-    left_wheel_reverse_disabled.value = True 
+    left_wheel_pid = PID(Kp=PID_KP, Ki=PID_KI, Kd=PID_KD)
+    left_wheel_reverse_switch = DigitalInOut(board.GP16)
+    left_wheel_reverse_switch.direction = Direction.OUTPUT
+    left_wheel_reverse_switch.value = True 
 
-    right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid, right_wheel_reverse_disabled)
-    left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid, left_wheel_reverse_disabled)
+    right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid, right_wheel_reverse_switch,True)
+    left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid, left_wheel_reverse_switch, False)
     
-    right_wheel_rpm_monitor_task = asyncio.create_task(right_wheel.rpm_monitor(2,0.5))
-    left_wheel_rpm_monitor_task = asyncio.create_task(left_wheel.rpm_monitor(2,0.5))
+    #right_wheel_rpm_monitor_task = asyncio.create_task(right_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
+    #left_wheel_rpm_monitor_task = asyncio.create_task(left_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
+    differential_synced_rpm_monitor_task = asyncio.create_task(
+            differential_synced_rpm_monitor(
+                left_wheel,
+                right_wheel,
+                min_ticks = DIFFERENTIAL_MIN_TICKS,
+                timeout=RPM_MONITOR_ZERO_TIMEOUT
+            )
+        )
     if DEMO:
         demo_mode_task = asyncio.create_task(demo_mode(right_wheel, left_wheel, bno055))
     else: 
         udp_input_monitor_task = asyncio.create_task(udp_monitor(right_wheel, left_wheel, bno055))
 
     imu_calibrated = False
-    right_wheel.target_rpm = 0
-    left_wheel.target_rpm = 0
+    await right_wheel.set_target_rpm(0)
+    await left_wheel.set_target_rpm(0)
     last_time = monotonic_ns() * SCALE_TIME_NS
     while True:
         loop_start = monotonic_ns() * SCALE_TIME_NS
         
-        if not imu_calibrated:
-            imu_calibrated = bno055.calibration_status[3] == 3
+        # print(
+        #     left_wheel.target_rpm,
+        #     left_wheel.current_rpm,
+        #     right_wheel.current_rpm
 
-        #update delta time for PID
-        dt = loop_start - last_time
-        last_time = loop_start
+        # )
+        # if not imu_calibrated:
+        #     imu_calibrated = bno055.calibration_status[3] == 3
 
-        #calculate error for PID
-        left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
-        right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
-        #print(f'left error:{left_error}\t\tright error:{right_error}')
+        # #update delta time for PID
+        # dt = loop_start - last_time
+        # last_time = loop_start
 
-        #calc PID adjustent
-        left_adjustment = left_wheel.pid.update(left_error, dt)
-        right_adjustment = right_wheel.pid.update(right_error,dt)
-        #print(
-            #  f'left rpm/adjustment:{int(left_wheel.current_rpm)}/{int(left_adjustment)}',
-            #  f'\t\tright rpm/adjustment:{int(right_wheel.current_rpm)}/{int(right_adjustment)}'
-            #  )
+        # #calculate error for PID
+        # left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
+        # right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
+        # #print(f'left error:{left_error}\t\tright error:{right_error}')
 
-        #update motor output
-        left_wheel.throttle = left_wheel.throttle + int(left_adjustment / SCALE_PWM)
-        #right_motor_output = clamp(right_wheel.pwm_out.duty_cycle + int(right_adjustment / SCALE_PWM),0,65535) 
-        
-        # right_wheel.pwm_out.duty_cycle = right_motor_output
-        #left_wheel.set_throttle(left_wheel.get_throttle() + int(left_adjustment / SCALE_PWM))
+        # #calc PID adjustent
+        # left_adjustment = left_wheel.pid.update(left_error, dt)
+        # right_adjustment = right_wheel.pid.update(right_error,dt)
+        # #print(
+        #     #  f'left rpm/adjustment:{int(left_wheel.current_rpm)}/{int(left_adjustment)}',
+        #     #  f'\t\tright rpm/adjustment:{int(right_wheel.current_rpm)}/{int(right_adjustment)}'
+        #     #  )
 
-        print(left_wheel.target_rpm, left_wheel.current_rpm)
+        # #update motor output
+        # left_wheel.throttle = left_wheel.throttle + int(left_adjustment / SCALE_PWM)
+        # right_wheel.throttle = right_wheel.throttle + int(right_adjustment / SCALE_PWM)
+
+        # print(left_wheel.target_rpm,
+        #     '\t',
+        #     int(left_wheel.current_rpm),
+        #     '\t\t',
+        #     right_wheel.target_rpm,
+        #     '\t',
+        #     int(right_wheel.current_rpm),
+        #       )
 
         # throttle loop based on desired rate
         loop_end = monotonic_ns() * SCALE_TIME_NS
@@ -298,6 +389,7 @@ async def main():
             #print( monotonic_ns() * SCALE_TIME_NS - loop_start)
         else:
             print(f'WARNING LOOP TIME OVERFLOW: {loop_duration}')
+        await asyncio.sleep(0)
 
 asyncio.run(main())
 
