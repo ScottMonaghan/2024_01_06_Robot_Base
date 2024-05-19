@@ -22,8 +22,8 @@ throttle_pot = AnalogIn(board.A0)
 MAX_RAW_THROTTLE = 64000
 MIN_RAW_THROTTLE = 500
 RATE_IN_HERTZ = 20
-MAX_RPM = 50
-MIN_RPM = 15
+MAX_RPM = 80
+MIN_RPM = 10
 
 btn_up= DigitalInOut(board.GP3)
 btn_down = DigitalInOut(board.GP2)
