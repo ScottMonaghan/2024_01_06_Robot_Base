@@ -38,8 +38,8 @@ RPM_MONITOR_ZERO_TIMEOUT = 0.5
 MIN_NONZERO_THROTTLE = 50
 DIFFERENTIAL_MIN_TICKS = 2
 PID_KP = 1.0
-PID_KI = 2e-5
-PID_KD = 0 
+PID_KI = 1.0
+PID_KD = 0
 
 #modified from https://www.kevsrobots.com/resources/how_it_works/pid-controllers.html
 class PID:
@@ -53,11 +53,19 @@ class PID:
 
     def update(self, error, dt):
         if dt > 0:
-            derivative = (error - self.last_error) / dt
+             derivative = (error - self.last_error) / dt
         else: 
-            derivative = 0
-        self.integral += error * dt
-        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+             derivative = 0
+        #if error crosses 0, then zero out integral
+        if self.last_error * error < 0:
+            self.integral = 0
+        else:
+            self.integral += error * dt
+        output = ( 
+            self.Kp * error  
+            + self.Ki * self.integral 
+            # + self.Kd * derivative
+        )
         self.last_error = error
         return output
 
@@ -65,6 +73,10 @@ class PulseRecord:
     def __init__(self, pulse_count, timestamp):
         self.pulse_count = pulse_count
         self.timestamp = timestamp
+
+class Robot:
+    def __init__(self):
+        self.target_heading = 0
 
 class ZS_X11H_BLDCWheel:
     def __init__(
@@ -74,7 +86,8 @@ class ZS_X11H_BLDCWheel:
             pulses_per_rotation:int,
             pid:PID,
             reverse_switch:DigitalInOut,
-            reverse_value: bool
+            reverse_value: bool,
+            brake:DigitalInOut
             ):
         self.pwm_out = pwm_out
         self.pulse_counter = pulse_counter
@@ -87,6 +100,7 @@ class ZS_X11H_BLDCWheel:
         self._reverse_switch = reverse_switch
         self._reverse_switch.value = not self._reverse_value
         self._lock_target_rpm = False
+        self.brake = brake
 
     @property
     def current_rpm(self):
@@ -190,10 +204,6 @@ def calc_rpm(wheel:ZS_X11H_BLDCWheel, start_time:float)->float:
     else:
         return wheel.current_rpm 
 
-class Robot:
-    def __init__(self):
-        self.target_heading = 0
-
 def clamp(value, min_value, max_value):
     if value < min_value:
         return min_value
@@ -203,7 +213,7 @@ def clamp(value, min_value, max_value):
         return value
     
 
-async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWheel, bno055:adafruit_bno055.BNO055_I2C):
+async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWheel, bno055:adafruit_bno055.BNO055_I2C, robot:Robot):
         #set up udp
     client_ipv4 =  ipaddress.IPv4Address(os.getenv('ROBOT_BASE_IPV4'))
     netmask =  ipaddress.IPv4Address(os.getenv('CIRCUITPY_NETMASK'))
@@ -228,7 +238,6 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
     buf = bytearray(MAXBUF)
     last_command_received = monotonic()
     SAFETY_TIMEOUT = 0.5
-    target_heading = 0
     while True:
         try:
             dataready, _, _ = select([sock],[],[],0)
@@ -241,7 +250,11 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
                 if received_args['command'] == 'STOP':
                     await right_wheel.set_target_rpm(0)
                     await left_wheel.set_target_rpm(0)
-                    target_heading = bno055.euler[0]
+                    left_wheel.pid.integral = 0
+                    right_wheel.pid.integral = 0
+                    robot.target_heading = bno055.euler[0]
+                    left_wheel.brake.value = True
+                    right_wheel.brake.value = True
                     #print(f'target heading:{target_heading}')
                 else:
                     if received_args['command'] == 'FORWARD':
@@ -250,6 +263,8 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
                         left_heading_multiplier = -1
                         right_heading_multiplier = 1
                         correct_heading = True
+                        left_wheel.brake.value = False
+                        right_wheel.brake.value = False
                     #     print('FORWARD')
                     elif received_args['command'] == 'BACK':
                         rw_target_rpm = -1 * received_args['target_rpm']
@@ -257,17 +272,27 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
                         left_heading_multiplier = 1
                         right_heading_multiplier = -1
                         correct_heading = True
+                        left_wheel.brake.value = False
+                        right_wheel.brake.value = False
                     elif received_args['command'] == 'RIGHT':
                         lw_target_rpm = 1 * received_args['target_rpm']
                         rw_target_rpm = -1 * received_args['target_rpm']
+                        left_wheel.brake.value = False
+                        right_wheel.brake.value = False
                     elif received_args['command'] == 'LEFT':
                         lw_target_rpm = -1 * received_args['target_rpm']
                         rw_target_rpm = 1 * received_args['target_rpm']
-
+                        left_wheel.brake.value = False
+                        right_wheel.brake.value = False
                     if correct_heading:
-                        heading_correction = ((bno055.euler[0] - target_heading)/180)
-                        if abs(heading_correction) > 180:
-                            heading_correction = 180 - heading_correction
+                        heading_delta = bno055.euler[0] - robot.target_heading
+                        if abs(heading_delta) > 180:
+                            if heading_delta < 0:
+                                sign_multiplier = -1
+                            else:
+                                sign_multiplier = 1
+                            heading_delta = (360 - abs(heading_delta)) * sign_multiplier *-1
+                        heading_correction = heading_delta / 180
                     else: heading_correction = 0
 
                     await left_wheel.set_target_rpm(int(lw_target_rpm + left_heading_multiplier * lw_target_rpm * heading_correction)) 
@@ -309,6 +334,9 @@ async def main():
     right_wheel_reverse_switch = DigitalInOut(board.GP0)
     right_wheel_reverse_switch.direction = Direction.OUTPUT
     right_wheel_reverse_switch.value = False 
+    right_wheel_brake = DigitalInOut(board.GP5)
+    right_wheel_brake.direction = Direction.OUTPUT
+    right_wheel_brake.value = False
 
     left_wheel_pwm = pwmio.PWMOut(board.GP4, frequency=20000)
     left_wheel_pulse_counter = countio.Counter(board.GP7, edge=countio.Edge.RISE)
@@ -316,10 +344,15 @@ async def main():
     left_wheel_reverse_switch = DigitalInOut(board.GP16)
     left_wheel_reverse_switch.direction = Direction.OUTPUT
     left_wheel_reverse_switch.value = True 
+    left_wheel_brake = DigitalInOut(board.GP14)
+    left_wheel_brake.direction = Direction.OUTPUT
+    left_wheel_brake.value = False
 
-    right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid, right_wheel_reverse_switch,True)
-    left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid, left_wheel_reverse_switch, False)
+    right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid, right_wheel_reverse_switch,True, right_wheel_brake)
+    left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid, left_wheel_reverse_switch, False,left_wheel_brake)
     
+    robot = Robot()
+
     #right_wheel_rpm_monitor_task = asyncio.create_task(right_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
     #left_wheel_rpm_monitor_task = asyncio.create_task(left_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
     differential_synced_rpm_monitor_task = asyncio.create_task(
@@ -333,7 +366,7 @@ async def main():
     if DEMO:
         demo_mode_task = asyncio.create_task(demo_mode(right_wheel, left_wheel, bno055))
     else: 
-        udp_input_monitor_task = asyncio.create_task(udp_monitor(right_wheel, left_wheel, bno055))
+        udp_input_monitor_task = asyncio.create_task(udp_monitor(right_wheel, left_wheel, bno055, robot))
 
     imu_calibrated = False
     await right_wheel.set_target_rpm(0)
@@ -342,12 +375,16 @@ async def main():
     while True:
         loop_start = monotonic_ns() * SCALE_TIME_NS
         
-        # print(
-        #     left_wheel.target_rpm,
-        #     left_wheel.current_rpm,
-        #     right_wheel.current_rpm
+        print(
+            left_wheel.pid.integral,
+            right_wheel.pid.integral,
+            left_wheel.target_rpm,
+            left_wheel.current_rpm,
+            right_wheel.target_rpm,
+            right_wheel.current_rpm,
+            robot.target_heading
 
-        # )
+        )
         # if not imu_calibrated:
         #     imu_calibrated = bno055.calibration_status[3] == 3
 
