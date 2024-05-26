@@ -1,14 +1,12 @@
 import board
 import pwmio
 from time import (
-    sleep,
     monotonic,
     monotonic_ns, 
     )
 from digitalio import(
     DigitalInOut,
-    Direction,
-    Pull,
+    Direction
 )
 import countio
 import asyncio
@@ -26,7 +24,7 @@ from random import (randrange, random)
 
 DEMO = False
 
-RATE = 10 #target rate in hz
+RATE = 100 #target rate in hz
 SCALE_TIME_NS = 1e-9
 SCALE_TIME_MS = 1e-3
 SCALE_PWM = 1e-1
@@ -40,6 +38,15 @@ DIFFERENTIAL_MIN_TICKS = 2
 PID_KP = 1.0
 PID_KI = 1.0
 PID_KD = 0
+
+#helper functions
+def clamp(value, min_value, max_value):
+    if value < min_value:
+        return min_value
+    elif value > max_value: 
+        return max_value
+    else:
+        return value
 
 #modified from https://www.kevsrobots.com/resources/how_it_works/pid-controllers.html
 class PID:
@@ -64,7 +71,7 @@ class PID:
         output = ( 
             self.Kp * error  
             + self.Ki * self.integral 
-            # + self.Kd * derivative
+            + self.Kd * derivative
         )
         self.last_error = error
         return output
@@ -73,10 +80,6 @@ class PulseRecord:
     def __init__(self, pulse_count, timestamp):
         self.pulse_count = pulse_count
         self.timestamp = timestamp
-
-class Robot:
-    def __init__(self):
-        self.target_heading = 0
 
 class ZS_X11H_BLDCWheel:
     def __init__(
@@ -91,8 +94,8 @@ class ZS_X11H_BLDCWheel:
             ):
         self.pwm_out = pwm_out
         self.pulse_counter = pulse_counter
+        self.pulses_per_rotation = pulses_per_rotation 
         self.pid = pid
-        self.rmp_monitor_enabled = True
         self._current_rpm = 0.0
         self._target_rpm = 0
         self._last_pulse_record = PulseRecord(self.pulse_counter.count,monotonic_ns() * SCALE_TIME_NS)
@@ -122,7 +125,7 @@ class ZS_X11H_BLDCWheel:
             # # we need to change direction
             self._target_rpm = 0
             self.throttle = 0
-            await asyncio.sleep(0.05)
+            #await asyncio.sleep(0.05)
             self._reverse_switch.value = not self._reverse_switch.value
             #now reset target value
             self._target_rpm = value
@@ -138,83 +141,66 @@ class ZS_X11H_BLDCWheel:
             value = 0
         self.pwm_out.duty_cycle = clamp(abs(value),0,65535)
     
-    async def rpm_monitor(self, min_ticks, timeout):
-        while True:
-            self.pulse_counter.reset()
-            start_time = monotonic()
-            while self.pulse_counter.count < min_ticks and monotonic()-start_time < timeout and self.rmp_monitor_enabled:
-                await asyncio.sleep(0)
-            if self.rmp_monitor_enabled:
-                if monotonic()-start_time > timeout:
-                    #print(monotonic()-start_time)
-                    self.current_rpm = 0
-                else:
-                    pulses_per_second = self.pulse_counter.count / (monotonic() - start_time)
-                    self.current_rpm = pulses_per_second / PULSES_PER_ROTATION * 60
-            await asyncio.sleep(0)
- 
-async def differential_synced_rpm_monitor(left_wheel:ZS_X11H_BLDCWheel, right_wheel:ZS_X11H_BLDCWheel, min_ticks:int, timeout:float):
+    def calc_rpm(self, start_time:float)->float:
+        duration = monotonic() - start_time
+        if duration > 0:
+            pulses_per_second = self.pulse_counter.count / duration
+            return pulses_per_second / self.pulses_per_rotation * 60
+        else:
+            return self.current_rpm 
+
+class Robot:
+    def __init__(self, left_wheel:ZS_X11H_BLDCWheel, right_wheel: ZS_X11H_BLDCWheel, bno055: adafruit_bno055.BNO055_I2C):
+        self.target_heading = 0
+        self.left_wheel = left_wheel
+        self.right_wheel = right_wheel
+        self.bno055 = bno055
+
+async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:float):
+    left_wheel = robot.left_wheel
+    right_wheel = robot.right_wheel
     while True:
         left_wheel.pulse_counter.reset()
         right_wheel.pulse_counter.reset()
         start_time = monotonic()
-        while (
-            (left_wheel.pulse_counter.count < min_ticks
-            or right_wheel.pulse_counter.count < min_ticks)
-            and monotonic()-start_time < timeout
-            ):
-            await asyncio.sleep(0)
+        if left_wheel.target_rpm == 0 and right_wheel.target_rpm == 0:
+            left_wheel.throttle = 0
+            right_wheel.throttle = 0
+        else:
+            if left_wheel.throttle != 0 and right_wheel.throttle !=0:
+                while (
+                    (left_wheel.pulse_counter.count < min_ticks
+                    or right_wheel.pulse_counter.count < min_ticks)
+                    and monotonic()-start_time < timeout
+                    ):
+                    await asyncio.sleep(0)
 
-        left_wheel.current_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else calc_rpm(left_wheel,start_time)
-        right_wheel.current_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else calc_rpm(right_wheel,start_time)
+            left_wheel.current_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else left_wheel.calc_rpm(start_time)
+            right_wheel.current_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else right_wheel.calc_rpm(start_time)
 
-        ##lets see what happens if we do pid here
-        current_time = monotonic_ns() * SCALE_TIME_NS
-        dt = current_time - left_wheel.pid.last_time
-        left_wheel.pid.last_time = current_time
-        right_wheel.pid.last_time = current_time
+            ##lets see what happens if we do pid here
+            current_time = monotonic_ns() * SCALE_TIME_NS
+            dt = current_time - left_wheel.pid.last_time
+            left_wheel.pid.last_time = current_time
+            right_wheel.pid.last_time = current_time
 
-        # calculate error for PID
-        left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
-        right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
- 
-        # #calc PID adjustent
-        left_adjustment = left_wheel.pid.update(left_error, dt)
-        right_adjustment = right_wheel.pid.update(right_error,dt)
+            # calculate error for PID
+            left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
+            right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
+    
+            # #calc PID adjustent
+            left_adjustment = left_wheel.pid.update(left_error, dt)
+            right_adjustment = right_wheel.pid.update(right_error,dt)
 
-        left_wheel.throttle = 0 if left_wheel.target_rpm == 0 else left_wheel.throttle + int(left_adjustment / SCALE_PWM)
-        right_wheel.throttle = 0 if right_wheel.target_rpm == 0 else right_wheel.throttle + int(right_adjustment / SCALE_PWM)
-
-        # print(
-        #     left_wheel.target_rpm,
-        #     left_wheel.current_rpm,
-        #     left_error,
-        #     left_adjustment,
-        #     left_wheel.throttle
-
-        # )
+            left_wheel.throttle = 0 if left_wheel.target_rpm == 0 else left_wheel.throttle + int(left_adjustment / SCALE_PWM)
+            right_wheel.throttle = 0 if right_wheel.target_rpm == 0 else right_wheel.throttle + int(right_adjustment / SCALE_PWM)
         await asyncio.sleep(0)
 
-
-def calc_rpm(wheel:ZS_X11H_BLDCWheel, start_time:float)->float:
-    duration = monotonic() - start_time
-    if duration > 0:
-        pulses_per_second = wheel.pulse_counter.count / duration
-        return pulses_per_second / PULSES_PER_ROTATION * 60
-    else:
-        return wheel.current_rpm 
-
-def clamp(value, min_value, max_value):
-    if value < min_value:
-        return min_value
-    elif value > max_value: 
-        return max_value
-    else:
-        return value
-    
-
-async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWheel, bno055:adafruit_bno055.BNO055_I2C, robot:Robot):
-        #set up udp
+async def udp_monitor(robot:Robot):
+    #set up udp
+    left_wheel = robot.left_wheel
+    right_wheel = robot.right_wheel
+    bno055 = robot.bno055
     client_ipv4 =  ipaddress.IPv4Address(os.getenv('ROBOT_BASE_IPV4'))
     netmask =  ipaddress.IPv4Address(os.getenv('CIRCUITPY_NETMASK'))
     gateway =  ipaddress.IPv4Address(os.getenv('CIRCUITPY_GATEWAY'))
@@ -309,10 +295,9 @@ async def udp_monitor(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWhee
             else: raise e
         await asyncio.sleep(0)
 
-async def demo_mode(right_wheel:ZS_X11H_BLDCWheel, left_wheel:ZS_X11H_BLDCWheel, bno055:adafruit_bno055.BNO055_I2C):
-    min_rpm = -100
-    max_rpm = 100
-    rpm_step = 20
+async def demo_mode(robot:Robot):
+    right_wheel = robot.right_wheel
+    left_wheel = robot.left_wheel
     step_delay = 5
     target_rpm = 0
     await left_wheel.set_target_rpm(target_rpm)
@@ -344,21 +329,18 @@ async def main():
     left_wheel_reverse_switch = DigitalInOut(board.GP16)
     left_wheel_reverse_switch.direction = Direction.OUTPUT
     left_wheel_reverse_switch.value = True 
-    left_wheel_brake = DigitalInOut(board.GP14)
+    left_wheel_brake = DigitalInOut(board.GP15)
     left_wheel_brake.direction = Direction.OUTPUT
     left_wheel_brake.value = False
 
     right_wheel = ZS_X11H_BLDCWheel(right_wheel_pwm, right_wheel_pulse_counter, PULSES_PER_ROTATION, right_wheel_pid, right_wheel_reverse_switch,True, right_wheel_brake)
     left_wheel = ZS_X11H_BLDCWheel(left_wheel_pwm,left_wheel_pulse_counter, PULSES_PER_ROTATION, left_wheel_pid, left_wheel_reverse_switch, False,left_wheel_brake)
     
-    robot = Robot()
+    robot = Robot(left_wheel,right_wheel, bno055)
 
-    #right_wheel_rpm_monitor_task = asyncio.create_task(right_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
-    #left_wheel_rpm_monitor_task = asyncio.create_task(left_wheel.rpm_monitor(2,RPM_MONITOR_ZERO_TIMEOUT))
     differential_synced_rpm_monitor_task = asyncio.create_task(
             differential_synced_rpm_monitor(
-                left_wheel,
-                right_wheel,
+                robot = robot,
                 min_ticks = DIFFERENTIAL_MIN_TICKS,
                 timeout=RPM_MONITOR_ZERO_TIMEOUT
             )
@@ -366,7 +348,7 @@ async def main():
     if DEMO:
         demo_mode_task = asyncio.create_task(demo_mode(right_wheel, left_wheel, bno055))
     else: 
-        udp_input_monitor_task = asyncio.create_task(udp_monitor(right_wheel, left_wheel, bno055, robot))
+        udp_input_monitor_task = asyncio.create_task(udp_monitor(robot))
 
     imu_calibrated = False
     await right_wheel.set_target_rpm(0)
@@ -385,45 +367,11 @@ async def main():
             robot.target_heading
 
         )
-        # if not imu_calibrated:
-        #     imu_calibrated = bno055.calibration_status[3] == 3
-
-        # #update delta time for PID
-        # dt = loop_start - last_time
-        # last_time = loop_start
-
-        # #calculate error for PID
-        # left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
-        # right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
-        # #print(f'left error:{left_error}\t\tright error:{right_error}')
-
-        # #calc PID adjustent
-        # left_adjustment = left_wheel.pid.update(left_error, dt)
-        # right_adjustment = right_wheel.pid.update(right_error,dt)
-        # #print(
-        #     #  f'left rpm/adjustment:{int(left_wheel.current_rpm)}/{int(left_adjustment)}',
-        #     #  f'\t\tright rpm/adjustment:{int(right_wheel.current_rpm)}/{int(right_adjustment)}'
-        #     #  )
-
-        # #update motor output
-        # left_wheel.throttle = left_wheel.throttle + int(left_adjustment / SCALE_PWM)
-        # right_wheel.throttle = right_wheel.throttle + int(right_adjustment / SCALE_PWM)
-
-        # print(left_wheel.target_rpm,
-        #     '\t',
-        #     int(left_wheel.current_rpm),
-        #     '\t\t',
-        #     right_wheel.target_rpm,
-        #     '\t',
-        #     int(right_wheel.current_rpm),
-        #       )
-
-        # throttle loop based on desired rate
+       
         loop_end = monotonic_ns() * SCALE_TIME_NS
         loop_duration = loop_end - loop_start
         if loop_duration < 1.0/RATE:
             await asyncio.sleep(1.0/RATE - loop_duration)
-            #print( monotonic_ns() * SCALE_TIME_NS - loop_start)
         else:
             print(f'WARNING LOOP TIME OVERFLOW: {loop_duration}')
         await asyncio.sleep(0)

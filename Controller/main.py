@@ -6,8 +6,8 @@ import adafruit_bno055
 import busio
 import adafruit_minimqtt.adafruit_minimqtt as MQTT
 
-i2c = busio.I2C(board.GP13,board.GP12)
-bno055 = adafruit_bno055.BNO055_I2C(i2c)
+#i2c = busio.I2C(board.GP13,board.GP12)
+#bno055 = adafruit_bno055.BNO055_I2C(i2c)
 
 import wifi
 import socketpool
@@ -21,9 +21,9 @@ import json
 throttle_pot = AnalogIn(board.A0)
 MAX_RAW_THROTTLE = 64000
 MIN_RAW_THROTTLE = 500
-RATE_IN_HERTZ = 20
-MAX_RPM = 80
-MIN_RPM = 10
+RATE_IN_HERTZ = 50
+MAX_RPM = 70
+MIN_RPM = 15
 
 btn_up= DigitalInOut(board.GP3)
 btn_down = DigitalInOut(board.GP2)
@@ -74,8 +74,8 @@ while True:
     loop_start = monotonic()
     target_loop_duration = 1.0/RATE_IN_HERTZ
 
-    if not imu_calibrated:
-        imu_calibrated = bno055.calibration_status[3] == 3
+    #if not imu_calibrated:
+    #    imu_calibrated = bno055.calibration_status[3] == 3
 
     #calculate target rpm
     raw_throttle = throttle_pot.value
@@ -93,7 +93,7 @@ while True:
 
     
     publish_args = {
-        "heading":-1.0 if not imu_calibrated else int(bno055.euler[0]),
+        #"heading":-1.0 if not imu_calibrated else int(bno055.euler[0]),
         "target_rpm":target_rpm,
         "command":command,
     }
