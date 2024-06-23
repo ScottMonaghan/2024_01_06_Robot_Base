@@ -8,7 +8,7 @@ from digitalio import(
     DigitalInOut,
     Direction
 )
-import countio
+import pulseio
 import asyncio
 import wifi
 import socketpool
@@ -36,17 +36,18 @@ MAX_THROTTLE = 10000 #safety
 
 RATE = 100 #target rate in hz
 SCALE_TIME_NS = 1e-9
+SCALE_TIME_MICROSEC = 1e-6
 SCALE_TIME_MS = 1e-3
 SCALE_PWM = 1e-1
 SCALE_ERROR = 10
 SCALE_HEADING_CORRECTION = 0.5
 PULSES_PER_ROTATION = 45
 MIN_PULSES_FOR_CALCULATION = 3
-RPM_MONITOR_ZERO_TIMEOUT = 0.5
+RPM_MONITOR_ZERO_TIMEOUT = 0.1
 MIN_NONZERO_THROTTLE = 50
 DIFFERENTIAL_MIN_TICKS = 2
 PID_KP = 1.0
-PID_KI = 1.0
+PID_KI = 0.5
 PID_KD = 0
 
 #helper functions
@@ -88,16 +89,11 @@ class PID:
         self.last_error = error
         return output
 
-class PulseRecord:
-    def __init__(self, pulse_count, timestamp):
-        self.pulse_count = pulse_count
-        self.timestamp = timestamp
-
 class ZS_X11H_BLDCWheel:
     def __init__(
             self,
             pwm_out:pwmio.PWMOut,
-            pulse_counter:countio.Counter,
+            pulse_counter:pulseio.PulseIn,
             pulses_per_rotation:int,
             pid:PID,
             reverse_switch:DigitalInOut,
@@ -110,7 +106,6 @@ class ZS_X11H_BLDCWheel:
         self.pid = pid
         self._current_rpm = 0.0
         self._target_rpm = 0
-        self._last_pulse_record = PulseRecord(self.pulse_counter.count,monotonic_ns() * SCALE_TIME_NS)
         self._reverse_value = reverse_value
         self._reverse_switch = reverse_switch
         self._reverse_switch.value = not self._reverse_value
@@ -162,11 +157,23 @@ class ZS_X11H_BLDCWheel:
         self.pwm_out.duty_cycle = clamp(abs(value),0,MAX_THROTTLE)
     
     def calc_rpm(self, start_time:float)->float:
-        duration = monotonic() - start_time
-        if duration > 0:
-            pulses_per_second = self.pulse_counter.count / duration * 1.0
-            return pulses_per_second / self.pulses_per_rotation * 60.0
+        pulse_count = len(self.pulse_counter)
+        if pulse_count > 0:
+            sum_pulse_length = 0
+            for _ in range(pulse_count):
+                pulse_length = self.pulse_counter.popleft()
+                sum_pulse_length += pulse_length
+            avg_pulse_length_microsec = sum_pulse_length / pulse_count 
+            #pulse duration * pulses_per_rotation = microseconds per rotation
+            microseconds_per_rotation = avg_pulse_length_microsec * self.pulses_per_rotation * 2
+            #Dividing by 1e+6 gets seconds per rotation
+            sec_per_rotation = microseconds_per_rotation / 1e+6
+            rpm = 60 / sec_per_rotation
+            #self.pulse_counter.clear()
+            return rpm
         else:
+            print("no pulses")
+            self.pulse_counter.resume()
             return self.current_abs_rpm 
 
 class Robot:
@@ -211,8 +218,8 @@ async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:fl
     left_wheel = robot.left_wheel
     right_wheel = robot.right_wheel
     while True:
-        left_wheel.pulse_counter.reset()
-        right_wheel.pulse_counter.reset()
+        #left_wheel.pulse_counter.reset()
+        #right_wheel.pulse_counter.reset()
         start_time = monotonic()
         if left_wheel.target_rpm == 0 and right_wheel.target_rpm == 0:
             left_wheel.throttle = 0
@@ -224,15 +231,15 @@ async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:fl
             right_wheel.pid.last_time = current_time
         else:
             if left_wheel.throttle != 0 and right_wheel.throttle !=0:
-                while (
-                    (left_wheel.pulse_counter.count < min_ticks
-                    or right_wheel.pulse_counter.count < min_ticks)
+                while ( 
+                    len(left_wheel.pulse_counter) == 0
+                    or len(left_wheel.pulse_counter) == 0
                     and monotonic()-start_time < timeout
                     ):
+                    #print('waiting')
                     await asyncio.sleep(0)
-
-            left_wheel.current_abs_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else left_wheel.calc_rpm(start_time)
-            right_wheel.current_abs_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else right_wheel.calc_rpm(start_time)
+            left_wheel.current_abs_rpm = 0 if len(left_wheel.pulse_counter) == 0 else left_wheel.calc_rpm(start_time)
+            right_wheel.current_abs_rpm = 0 if len(right_wheel.pulse_counter) == 0 else right_wheel.calc_rpm(start_time)
 
             ##lets see what happens if we do pid here
             current_time = monotonic_ns() * SCALE_TIME_NS
@@ -362,7 +369,7 @@ async def demo_mode(robot:Robot):
     while True:
         lv_multiplier = 1 if random() > 1/2 else -1
         av_multiplier = 1 if random() > 1/2 else -1
-        new_target_linear_velocity = 0.2
+        new_target_linear_velocity = uniform(0.2,0.5) * lv_multiplier
         new_target_angular_velocity = uniform(0,2) * av_multiplier
         await robot.set_target_linear_and_angular_velocity(new_target_linear_velocity, new_target_angular_velocity)
         await asyncio.sleep(step_delay)
@@ -371,7 +378,11 @@ async def main():
     i2c = busio.I2C(board.GP13,board.GP12)
     bno055 = adafruit_bno055.BNO055_I2C(i2c)
     right_wheel_pwm = pwmio.PWMOut(board.GP1, frequency=20000)
-    right_wheel_pulse_counter = countio.Counter(board.GP3, edge=countio.Edge.RISE)
+    right_wheel_pulse_counter = pulseio.PulseIn(
+        pin=board.GP3,
+        maxlen = 10, #2 is default
+        idle_state=False #false is default, this sets idle state to low
+        ) #countio.Counter(board.GP3, edge=countio.Edge.RISE)
     right_wheel_pid = PID(Kp=PID_KP, Ki=PID_KI, Kd=PID_KD)
     right_wheel_reverse_switch = DigitalInOut(board.GP0)
     right_wheel_reverse_switch.direction = Direction.OUTPUT
@@ -381,7 +392,11 @@ async def main():
     right_wheel_brake.value = False
 
     left_wheel_pwm = pwmio.PWMOut(board.GP4, frequency=20000)
-    left_wheel_pulse_counter = countio.Counter(board.GP7, edge=countio.Edge.RISE)
+    left_wheel_pulse_counter = pulseio.PulseIn(
+        pin=board.GP7,
+        maxlen = 10, #2 is default
+        idle_state=False #false is default, this sets idle state to low
+        ) #countio.Counter(board.GP3, edge=countio.Edge.RISE)
     left_wheel_pid = PID(Kp=PID_KP, Ki=PID_KI, Kd=PID_KD)
     left_wheel_reverse_switch = DigitalInOut(board.GP16)
     left_wheel_reverse_switch.direction = Direction.OUTPUT
@@ -413,19 +428,18 @@ async def main():
     last_time = monotonic_ns() * SCALE_TIME_NS
     while True:
         loop_start = monotonic_ns() * SCALE_TIME_NS
-        
         print(
-            #f'ltrpm:{left_wheel.target_rpm:.2f}\t',
-            # f'lcrpm:{left_wheel.current_signed_rpm:.2f}\t',
-            #f'rtrpm:{right_wheel.target_rpm:.2f}\t',
-            # f'rcrpm:{right_wheel.current_signed_rpm:.2f}\t',
-            f'target lv:{robot.target_linear_velocity:.2f} m\s\t',
-            f'actual lv:{robot.get_current_linear_velocity():.2f} m\s\t',
-            f'target av:{robot.target_angular_velocity:.2f} rad\s\t',
-            f'actual av:{robot.get_current_angular_velocity():.2f} rad\s\t',
+            f'ltrpm:{left_wheel.target_rpm:.2f}\t',
+            f'lcrpm:{left_wheel.current_signed_rpm:.2f}\t',
+            f'rtrpm:{right_wheel.target_rpm:.2f}\t',
+            f'rcrpm:{right_wheel.current_signed_rpm:.2f}\t',
+            # f'target lv:{robot.target_linear_velocity:.2f} m\s\t',
+            # f'actual lv:{robot.get_current_linear_velocity():.2f} m\s\t',
+            # f'target av:{robot.target_angular_velocity:.2f} rad\s\t',
+            # f'actual av:{robot.get_current_angular_velocity():.2f} rad\s\t',
             '\r'
         )
-       
+        
         loop_end = monotonic_ns() * SCALE_TIME_NS
         loop_duration = loop_end - loop_start
         if loop_duration < 1.0/RATE:
