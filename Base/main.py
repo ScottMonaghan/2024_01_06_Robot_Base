@@ -20,9 +20,19 @@ import adafruit_bno055
 from select import select
 import busio
 from errno import ETIMEDOUT
-from random import (randrange, random)
+from random import (randrange, uniform, random)
 
 DEMO = False
+
+#physical robot dimensions. Need to be adjusted to specific robot implementation
+WHEEL_CIRCUMFERENCE = 0.47878 #m
+BASE_TURN_CIRCUMFERENCE = 1.6757 #m
+WHEEL_ROTATIONS_PER_TURN = 3.5
+RPM_DIFFERENTIAL_TO_RAD_PER_SEC = 0.01495883 #rad/sec
+RPM_LINEAR_TO_METERS_PER_SEC = 0.0079797 #m/sec
+MAX_ABS_RPM = 150 #safety
+MIN_ABS_RPM = 15 
+MAX_THROTTLE = 10000 #safety
 
 RATE = 100 #target rate in hz
 SCALE_TIME_NS = 1e-9
@@ -57,7 +67,9 @@ class PID:
         self.last_error = 0
         self.integral = 0
         self.last_time = 0
-
+    def reset(self):
+        self.last_error = 0
+        self.integral = 0
     def update(self, error, dt):
         if dt > 0:
              derivative = (error - self.last_error) / dt
@@ -106,12 +118,19 @@ class ZS_X11H_BLDCWheel:
         self.brake = brake
 
     @property
-    def current_rpm(self):
+    def current_abs_rpm(self):
         return self._current_rpm
     
-    @current_rpm.setter
-    def current_rpm(self, value):
+    @current_abs_rpm.setter
+    def current_abs_rpm(self, value):
         self._current_rpm = value
+
+    @property
+    def current_signed_rpm(self):
+        if self._reverse_value == self._reverse_switch.value:
+            return -1 * self._current_rpm
+        else:
+            return self._current_rpm  
 
     @property
     def target_rpm(self):
@@ -125,11 +144,12 @@ class ZS_X11H_BLDCWheel:
             # # we need to change direction
             self._target_rpm = 0
             self.throttle = 0
-            #await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
             self._reverse_switch.value = not self._reverse_switch.value
-            #now reset target value
-            self._target_rpm = value
-        self._target_rpm = value
+        if value != 0 and abs(value) < MIN_ABS_RPM:
+            if value > 0: value = MIN_ABS_RPM
+            else: value = -1 * MIN_ABS_RPM
+        self._target_rpm = clamp(value,-1*MAX_ABS_RPM,MAX_ABS_RPM)
 
     @property
     def throttle(self):
@@ -139,15 +159,15 @@ class ZS_X11H_BLDCWheel:
     def throttle(self, value):
         if value < MIN_NONZERO_THROTTLE: 
             value = 0
-        self.pwm_out.duty_cycle = clamp(abs(value),0,65535)
+        self.pwm_out.duty_cycle = clamp(abs(value),0,MAX_THROTTLE)
     
     def calc_rpm(self, start_time:float)->float:
         duration = monotonic() - start_time
         if duration > 0:
-            pulses_per_second = self.pulse_counter.count / duration
-            return pulses_per_second / self.pulses_per_rotation * 60
+            pulses_per_second = self.pulse_counter.count / duration * 1.0
+            return pulses_per_second / self.pulses_per_rotation * 60.0
         else:
-            return self.current_rpm 
+            return self.current_abs_rpm 
 
 class Robot:
     def __init__(self, left_wheel:ZS_X11H_BLDCWheel, right_wheel: ZS_X11H_BLDCWheel, bno055: adafruit_bno055.BNO055_I2C):
@@ -155,6 +175,37 @@ class Robot:
         self.left_wheel = left_wheel
         self.right_wheel = right_wheel
         self.bno055 = bno055
+        self._target_linear_velocity = 0 #m/sec
+        self._target_angular_velocity = 0 #rad/sec
+
+    async def _update_target_rpm(self):
+        #first set the base target rpm for linear velocity for both wheels
+        lv_target_rpm = self._target_linear_velocity / RPM_LINEAR_TO_METERS_PER_SEC
+        #next angular velocity differential
+        av_differential = self._target_angular_velocity / RPM_DIFFERENTIAL_TO_RAD_PER_SEC
+        #adjust individual wheel target rpm (w/reminder av is counterclockwise)
+        await self.right_wheel.set_target_rpm(lv_target_rpm + av_differential/2)
+        await self.left_wheel.set_target_rpm(lv_target_rpm - av_differential/2)
+    
+    @property
+    def target_linear_velocity(self):
+        return self._target_linear_velocity
+    
+    async def set_target_linear_and_angular_velocity(self, lv, av):
+        self._target_linear_velocity = lv
+        self._target_angular_velocity = av
+        await self._update_target_rpm()
+
+    @property
+    def target_angular_velocity(self):
+        return self._target_angular_velocity
+    
+    def get_current_linear_velocity(self):
+        return (self.left_wheel.current_signed_rpm+self.right_wheel.current_signed_rpm)/2 * RPM_LINEAR_TO_METERS_PER_SEC
+    def get_current_angular_velocity(self):
+        #positive angular velocity is counterclockwise
+        return (self.right_wheel.current_signed_rpm-self.left_wheel.current_signed_rpm) * RPM_DIFFERENTIAL_TO_RAD_PER_SEC
+    
 
 async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:float):
     left_wheel = robot.left_wheel
@@ -166,6 +217,11 @@ async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:fl
         if left_wheel.target_rpm == 0 and right_wheel.target_rpm == 0:
             left_wheel.throttle = 0
             right_wheel.throttle = 0
+            left_wheel.current_abs_rpm = 0
+            right_wheel.current_abs_rpm = 0
+            current_time = monotonic_ns() * SCALE_TIME_NS
+            left_wheel.pid.last_time = current_time
+            right_wheel.pid.last_time = current_time
         else:
             if left_wheel.throttle != 0 and right_wheel.throttle !=0:
                 while (
@@ -175,8 +231,8 @@ async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:fl
                     ):
                     await asyncio.sleep(0)
 
-            left_wheel.current_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else left_wheel.calc_rpm(start_time)
-            right_wheel.current_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else right_wheel.calc_rpm(start_time)
+            left_wheel.current_abs_rpm = 0 if left_wheel.pulse_counter.count < min_ticks else left_wheel.calc_rpm(start_time)
+            right_wheel.current_abs_rpm = 0 if right_wheel.pulse_counter.count < min_ticks else right_wheel.calc_rpm(start_time)
 
             ##lets see what happens if we do pid here
             current_time = monotonic_ns() * SCALE_TIME_NS
@@ -185,8 +241,8 @@ async def differential_synced_rpm_monitor(robot:Robot, min_ticks:int, timeout:fl
             right_wheel.pid.last_time = current_time
 
             # calculate error for PID
-            left_error = (abs(left_wheel.target_rpm) - left_wheel.current_rpm) 
-            right_error = (abs(right_wheel.target_rpm) - right_wheel.current_rpm)
+            left_error = (abs(left_wheel.target_rpm) - left_wheel.current_abs_rpm) 
+            right_error = (abs(right_wheel.target_rpm) - right_wheel.current_abs_rpm)
     
             # #calc PID adjustent
             left_adjustment = left_wheel.pid.update(left_error, dt)
@@ -298,16 +354,17 @@ async def udp_monitor(robot:Robot):
 async def demo_mode(robot:Robot):
     right_wheel = robot.right_wheel
     left_wheel = robot.left_wheel
-    step_delay = 5
+    step_delay = 8
     target_rpm = 0
-    await left_wheel.set_target_rpm(target_rpm)
-    await right_wheel.set_target_rpm(target_rpm)
+    await left_wheel.set_target_rpm(0)
+    await right_wheel.set_target_rpm(0)
     step_multiplier = 1
     while True:
-        new_abs_target_rpm = randrange(15,40)
-        multiplier = 1 if random() * 2 -1 > 0 else -1
-        await left_wheel.set_target_rpm(new_abs_target_rpm * multiplier)
-        await right_wheel.set_target_rpm(new_abs_target_rpm * multiplier)
+        lv_multiplier = 1 if random() > 1/2 else -1
+        av_multiplier = 1 if random() > 1/2 else -1
+        new_target_linear_velocity = 0.2
+        new_target_angular_velocity = uniform(0,2) * av_multiplier
+        await robot.set_target_linear_and_angular_velocity(new_target_linear_velocity, new_target_angular_velocity)
         await asyncio.sleep(step_delay)
 
 async def main():
@@ -346,7 +403,7 @@ async def main():
             )
         )
     if DEMO:
-        demo_mode_task = asyncio.create_task(demo_mode(right_wheel, left_wheel, bno055))
+        demo_mode_task = asyncio.create_task(demo_mode(robot))
     else: 
         udp_input_monitor_task = asyncio.create_task(udp_monitor(robot))
 
@@ -358,14 +415,15 @@ async def main():
         loop_start = monotonic_ns() * SCALE_TIME_NS
         
         print(
-            left_wheel.pid.integral,
-            right_wheel.pid.integral,
-            left_wheel.target_rpm,
-            left_wheel.current_rpm,
-            right_wheel.target_rpm,
-            right_wheel.current_rpm,
-            robot.target_heading
-
+            #f'ltrpm:{left_wheel.target_rpm:.2f}\t',
+            # f'lcrpm:{left_wheel.current_signed_rpm:.2f}\t',
+            #f'rtrpm:{right_wheel.target_rpm:.2f}\t',
+            # f'rcrpm:{right_wheel.current_signed_rpm:.2f}\t',
+            f'target lv:{robot.target_linear_velocity:.2f} m\s\t',
+            f'actual lv:{robot.get_current_linear_velocity():.2f} m\s\t',
+            f'target av:{robot.target_angular_velocity:.2f} rad\s\t',
+            f'actual av:{robot.get_current_angular_velocity():.2f} rad\s\t',
+            '\r'
         )
        
         loop_end = monotonic_ns() * SCALE_TIME_NS
